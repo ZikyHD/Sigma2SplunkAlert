@@ -8,11 +8,21 @@ import argparse
 import os
 import yaml
 import subprocess
+import re
 from subprocess import DEVNULL
 from jinja2 import Environment, FileSystemLoader
+import binascii
 from classes.UseCase import UseCase
 from classes.DetectionRuleConverter import DetectionRuleConverter
 
+def CRC32_from_string(string):
+    buf = (binascii.crc32(string.encode('utf8')) & 0xFFFFFFFF)
+    return "%08X" % buf    
+
+def CRC32_from_file(filename):
+    buf = open(filename,'rb').read()
+    buf = (binascii.crc32(buf) & 0xFFFFFFFF)
+    return "%08X" % buf
 
 def main(argv):
     # parse input variables
@@ -20,12 +30,16 @@ def main(argv):
         description='Convert Sigma rules to Splunk Alerts savedsearches.conf configuration.')
     parser.add_argument('rules', action='store', metavar='N', nargs='+',
                         help='folder or file containing the Sigma rules')
+    parser.add_argument('--sigmac-path', '-p', action='store', dest='sigmac',
+                        help='Sigmac path')                        
     parser.add_argument('--config', '-c', action='store', dest='config',
                         help='Sigma2SplunkAlert configuration file')
-    parser.add_argument('--sigma-config', '-sc', action='store', dest='sigma_config',
+    parser.add_argument('--sigma-config', '-sc', action='store', dest='sigma_configs', nargs='+', type=str,
                         help='Sigma configuration with field name and index name mapping')
     parser.add_argument('--template', '-t', action='store', dest='template',
                         help='file containing the savedsearches.conf template')
+    parser.add_argument('--filter', '-f', action='store', dest='filter_file',
+                        help='file containing path (or part of path) of rules to ignore')
 
     cmdargs = parser.parse_args()
 
@@ -34,16 +48,33 @@ def main(argv):
         converter_config_path = cmdargs.config
     else:
         converter_config_path = 'config/config.yml'
+        
+    # cmdargs Sigmac Path
+    if cmdargs.sigmac:
+        sigma_path = cmdargs.sigmac
+    else:
+        sigma_path = 'sigmac'    
 
     # cmdargs Sigma Configuration
-    if cmdargs.sigma_config:
-        sigma_config_path = cmdargs.sigma_config
+    sigma_config_path = ''
+    if cmdargs.sigma_configs:
+        for sigma_config in cmdargs.sigma_configs:
+            sigma_config_path += "-c {} ".format(sigma_config)
     else:
-        sigma_config_path = 'sigma_config/splunk-all.yml'
+        sigma_config_path = '- c ./sigma_config/splunk-all.yml'
         
     # cmdargs template Configuration
     if cmdargs.template:
         template_path = cmdargs.template
+        
+    # cmdargs filter Configuration
+    filterList = []
+    if cmdargs.filter_file:
+        try:
+            with open(cmdargs.filter_file) as filterFile:
+                filterList = filterFile.read().splitlines()
+        except FileNotFoundError:
+            print("Filter File not found. No filters will be applied.")
 
     # Splunk Search Converter
 
@@ -56,20 +87,27 @@ def main(argv):
 
     # Iterate through N input folders
     for input_path in input_path_list:
-        files = loadSigmaRules(input_path)
+        files = loadSigmaRules(input_path,filterList)
         for file in files:
             # Load Sigma Rule
             sigma_rule = openSigmaDetectionRule(file)
 
             # Convert Sigma Rule to Splunk Search
-            splunk_search = DetectionRuleConverter.convertSigmaRule(sigma_config_path, file)
-            if splunk_search == "Converter Failure":
+            splunk_search_results = DetectionRuleConverter.convertSigmaRule(sigma_path,sigma_config_path, file)
+            if type(splunk_search_results) is not dict and "Converter Failure" in splunk_search_results:
                 continue
+            splunk_search = splunk_search_results['search']
+            splunk_search_fields = splunk_search_results['fields']
 
             # Perform Splunk Search transformations
             if "search_transformations" in sigma2splunkalertconfig:
                 splunk_search = DetectionRuleConverter.performSearchTransformation(
-                    sigma2splunkalertconfig["search_transformations"], splunk_search, sigma_rule)
+                    sigma2splunkalertconfig["search_transformations"], splunk_search, splunk_search_fields, sigma_rule)
+
+            # Add Splunk initial filter
+            if "search_initial_filter" in sigma2splunkalertconfig:
+                splunk_search = DetectionRuleConverter.addSearchFilter(
+                    sigma2splunkalertconfig["search_initial_filter"], splunk_search, sigma_rule)
 
             # Alert with Summary index
             splunk_search = DetectionRuleConverter.addToSummaryIndex(
@@ -122,19 +160,27 @@ def openSigmaDetectionRule(rule_path):
         except yaml.YAMLError as exc:
             print(exc)
             sys.exit(1)
+        if 'title' in sigma_uc:
+            if 'id' in sigma_uc:
+                sigma_uc['title'] = sigma_uc['title'] + ' - ' + CRC32_from_string(sigma_uc['id'])
+            else:
+                sigma_uc['title'] = sigma_uc['title'] + ' - ' + CRC32_from_file(rule_path)
     return sigma_uc
 
 
-def loadSigmaRules(path):
+def loadSigmaRules(path, filterList):
     files = []
     if os.path.isfile(path):
-        files.append(path)
+        if not filterList or ( filterList and not any(s in path for s in filterList)):
+            files.append(path)
     else:
         # r=root, d=directories, f = files
         for r, d, f in os.walk(path):
             for file in f:
                 if '.yml' in file:
-                    files.append(os.path.join(r, file))
+                    fileName = os.path.join(r, file)
+                    if not filterList or ( filterList and not any(s in fileName for s in filterList)):
+                        files.append(fileName)
     return files
 
 

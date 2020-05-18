@@ -1,16 +1,23 @@
 app: 'sigma_hunting_app'
 cron_schedule: '*/10 * * * *'
-earliest_time: '-10m'
+earliest_time: '0'
 latest_time: 'now'
 schedule_window: auto
-allow_skew: '50%'
+allow_skew: '1h'
+search_initial_filter: '`sigma_hunt` | stats last(rule_next_filter) as rule_next_filter | return $rule_next_filter ]' 
 search_transformations:
+    - add_table
+    - add_time_field
     - add_host_field
+    - add_sourcetype_field
+    - add_index_field
+    - add_rawHash_field
+    - add_FIELDLIST_field
     - add_transforming_command
-    - add_whitelist
+    - add_whitelist_in_front
 alert_action:
     summary_index:
-        name: 'threat-hunting'
+        name: 'sigma_matches'
         enrich_tags: 1
         enrich_level: 1
     email:
